@@ -470,12 +470,185 @@ function buildInsights(records) {
   };
 }
 
+function extractComparisonCount(input) {
+  const normalized = normalizeText(input).toLowerCase();
+  const explicitMatch = normalized.match(/\b(\d+)\s+(?:areas?|zones?|neighborhoods?)\b/);
+  if (explicitMatch) return Math.max(2, Math.min(10, Number(explicitMatch[1])));
+
+  const topMatch = normalized.match(/\btop\s+(\d+)\b/);
+  if (topMatch) return Math.max(2, Math.min(10, Number(topMatch[1])));
+
+  return null;
+}
+
+function extractComparisonZones(input, zoneMetrics, sortedTopTen) {
+  const normalizedInput = normalizeText(input);
+  const matches = [];
+  const seen = new Set();
+
+  const explicitPatterns = [
+    /\b(?:community\s+area|area)\s*(\d{1,3})\b/gi,
+    /\bward\s*(\d{1,3})\b/gi,
+    /\bzip\s*(\d{5})\b/gi,
+  ];
+
+  explicitPatterns.forEach((pattern) => {
+    const patternMatches = normalizedInput.matchAll(pattern);
+    for (const match of patternMatches) {
+      const value = match[1];
+      const candidate = zoneMetrics.find((zone) => `${zone.id}`.includes(value) || zone.name.toLowerCase().includes(value.toLowerCase()));
+      if (candidate && !seen.has(candidate.id)) {
+        seen.add(candidate.id);
+        matches.push(candidate);
+      }
+    }
+  });
+
+  if (matches.length) {
+    return matches;
+  }
+
+  const segments = normalizedInput
+    .split(/\s+(?:and|,|vs|versus|compared to|compare|between)\s+/i)
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+
+  segments.forEach((segment) => {
+    const candidate = zoneMetrics.find((zone) => zone.name.toLowerCase().includes(segment.toLowerCase()) || `${zone.id}`.includes(segment));
+    if (candidate && !seen.has(candidate.id)) {
+      seen.add(candidate.id);
+      matches.push(candidate);
+    }
+  });
+
+  if (matches.length) {
+    return matches;
+  }
+
+  const comparisonCount = extractComparisonCount(normalizedInput);
+  if (comparisonCount) {
+    return sortedTopTen.slice(0, comparisonCount).filter((zone) => zone && !seen.has(zone.id));
+  }
+
+  return [];
+}
+
+function buildLocalAiReply(input, activeZone, liveCityStats, sortedTopTen, resolvedZones, zoneMetrics) {
+  const zoneName = activeZone?.name || 'the city';
+  const issue = activeZone?.topType || 'service demand';
+  const backlog = activeZone?.unresolved || 0;
+  const growth = activeZone?.growth || 0;
+  const score = activeZone?.score || 0;
+  const normalized = normalizeText(input).toLowerCase();
+  const wantsComparison = normalized.includes('compare') || normalized.includes('vs') || normalized.includes('versus') || normalized.includes('between') || normalized.includes('difference');
+
+  if (!activeZone) {
+    return 'No zone is selected right now. Pick a priority zone to inspect it.';
+  }
+
+  const comparisonZones = wantsComparison ? extractComparisonZones(input, zoneMetrics, sortedTopTen) : [];
+
+  if (wantsComparison && comparisonZones.length > 1) {
+    const ranked = [...comparisonZones].sort((a, b) => b.score - a.score);
+    const highest = ranked[0];
+    const lowest = ranked[ranked.length - 1];
+    const bullets = ranked.map((zone) => `${zone.name} (score ${zone.score}, ${zone.unresolved}% unresolved, ${zone.complaints} requests)`).join('; ');
+    return `I compared ${ranked.length} areas: ${bullets}. ${highest.name} is the highest-risk area at score ${highest.score}, while ${lowest.name} is the lowest among the set at score ${lowest.score}.`;
+  }
+
+  if (resolvedZones[activeZone.id]) {
+    return `${zoneName} has already been cleared. The area now shows no active problem and the board has been updated.`;
+  }
+
+  if (!input) {
+    return `${zoneName} is currently ranked with a risk score of ${score} because it shows ${backlog}% unresolved demand and a ${growth}% growth signal in ${issue.toLowerCase()}.`;
+  }
+
+  const rank = sortedTopTen.findIndex((zone) => zone.id === activeZone.id) + 1;
+  const cityAvg = liveCityStats.avgScore;
+
+  if (wantsComparison) {
+    const nextZone = sortedTopTen.find((zone) => zone.id !== activeZone.id && zone.score > 0);
+    return `${zoneName} is ranked #${rank} with a ${score} risk score. It is ${score >= cityAvg ? 'above' : 'near'} the city average, while ${nextZone?.name || 'the next area'} is the closest comparable hotspot.`;
+  }
+
+  if (normalized.includes('action') || normalized.includes('next')) {
+    return `Recommended next step: dispatch a response crew to ${zoneName} to focus on ${issue.toLowerCase()} and clear the ${backlog}% open backlog.`;
+  }
+
+  if (normalized.includes('why') || normalized.includes('rank')) {
+    return `${zoneName} ranks high because it shows ${backlog}% unresolved demand, a ${growth}% surge in ${issue.toLowerCase()}, and a current risk score of ${score}.`;
+  }
+
+  if (normalized.includes('department')) {
+    return `The most relevant department for ${zoneName} is ${activeZone?.topDepartment || 'city operations'}, especially for ${issue.toLowerCase()} follow-up.`;
+  }
+
+  return `You asked about ${zoneName}. It is currently seeing concentrated pressure in ${issue.toLowerCase()} with a ${growth}% spike and ${backlog}% unresolved demand.`;
+}
+
+async function generateAIPulseReply(input, activeZone, liveCityStats, sortedTopTen, resolvedZones, zoneMetrics) {
+  const apiKey = import.meta.env.VITE_OPENAI_API_KEY;
+
+  if (!apiKey) {
+    return {
+      reply: buildLocalAiReply(input, activeZone, liveCityStats, sortedTopTen, resolvedZones, zoneMetrics),
+      mode: 'AI demo • local intelligence',
+    };
+  }
+
+  try {
+    const prompt = `You are CivicPulse AI for city operations. Use the supplied context to answer briefly and specifically.
+User question: ${input || 'Give me a quick pulse summary'}
+Context: zone=${activeZone?.name || 'citywide'}, issue=${activeZone?.topType || 'service demand'}, backlog=${activeZone?.unresolved || 0}%, growth=${activeZone?.growth || 0}%, score=${activeZone?.score || 0}.`;
+
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        temperature: 0.7,
+        messages: [
+          {
+            role: 'system',
+            content: 'You are CivicPulse AI, a concise city operations analyst. Give practical, grounded answers based on the provided context.',
+          },
+          { role: 'user', content: prompt },
+        ],
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error('OpenAI request failed');
+    }
+
+    const data = await response.json();
+    const aiText = data.choices?.[0]?.message?.content?.trim();
+
+    if (aiText) {
+      return { reply: aiText, mode: 'AI live • OpenAI' };
+    }
+  } catch (error) {
+    console.warn('OpenAI response unavailable, using local intelligence instead.', error);
+  }
+
+  return {
+    reply: buildLocalAiReply(input, activeZone, liveCityStats, sortedTopTen, resolvedZones, zoneMetrics),
+    mode: 'AI fallback • local intelligence',
+  };
+}
+
 function App() {
   const [query, setQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
   const [selectedZoneId, setSelectedZoneId] = useState(null);
   const [chatInput, setChatInput] = useState('');
   const [chatResponse, setChatResponse] = useState('Ask about a neighborhood, issue, or department and CivicPulse will explain the signal.');
+  const [aiStatus, setAiStatus] = useState('AI demo • local intelligence ready');
+  const [isAiThinking, setIsAiThinking] = useState(false);
   const [tasks, setTasks] = useState([]);
   const [taskMessage, setTaskMessage] = useState('');
   const [resolvedZones, setResolvedZones] = useState({});
@@ -616,8 +789,9 @@ function App() {
     || null;
   const topZone = sortedTopTen[0] || null;
 
-  const handlePulseCheck = (event) => {
+  const handlePulseCheck = async (event) => {
     event.preventDefault();
+    setIsAiThinking(true);
     const input = chatInput.trim();
     const requestedZone = input ? findZoneByArea(input, zoneMetrics) : null;
     if (requestedZone) {
@@ -625,53 +799,19 @@ function App() {
     }
 
     const activeZone = requestedZone || selected;
-    const zoneName = activeZone?.name || 'the city';
-    const issue = activeZone?.topType || 'service demand';
-    const backlog = activeZone?.unresolved || 0;
-    const growth = activeZone?.growth || 0;
-    const score = activeZone?.score || 0;
 
-    if (!activeZone) {
-      setChatResponse('No zone is selected right now. Pick a priority zone to inspect it.');
-      return;
-    }
+    const { reply, mode } = await generateAIPulseReply(
+      input,
+      activeZone,
+      liveCityStats,
+      sortedTopTen,
+      resolvedZones,
+      zoneMetrics,
+    );
 
-    if (resolvedZones[activeZone.id]) {
-      setChatResponse(`${zoneName} has already been cleared. The area now shows no active problem and the board has been updated.`);
-      return;
-    }
-
-    if (!input) {
-      setChatResponse(`${zoneName} is currently ranked with a risk score of ${score} because it shows ${backlog}% unresolved demand and a ${growth}% growth signal in ${issue.toLowerCase()}.`);
-      return;
-    }
-
-    const normalized = input.toLowerCase();
-    const rank = sortedTopTen.findIndex((zone) => zone.id === activeZone.id) + 1;
-    const cityAvg = liveCityStats.avgScore;
-
-    if (normalized.includes('compare')) {
-      const nextZone = sortedTopTen.find((zone) => zone.id !== activeZone.id && zone.score > 0);
-      setChatResponse(`${zoneName} is ranked #${rank} with a ${score} risk score. It is ${score >= cityAvg ? 'above' : 'near'} the city average, while ${nextZone?.name || 'the next area'} is the closest comparable hotspot.`);
-      return;
-    }
-
-    if (normalized.includes('action') || normalized.includes('next')) {
-      setChatResponse(`Recommended next step: dispatch a response crew to ${zoneName} to focus on ${issue.toLowerCase()} and clear the ${backlog}% open backlog.`);
-      return;
-    }
-
-    if (normalized.includes('why') || normalized.includes('rank')) {
-      setChatResponse(`${zoneName} ranks high because it shows ${backlog}% unresolved demand, a ${growth}% surge in ${issue.toLowerCase()}, and a current risk score of ${score}.`);
-      return;
-    }
-
-    if (normalized.includes('department')) {
-      setChatResponse(`The most relevant department for ${zoneName} is ${activeZone?.topDepartment || 'city operations'}, especially for ${issue.toLowerCase()} follow-up.`);
-      return;
-    }
-
-    setChatResponse(`You asked about ${zoneName}. It is currently seeing concentrated pressure in ${issue.toLowerCase()} with a ${growth}% spike and ${backlog}% unresolved demand.`);
+    setChatResponse(reply);
+    setAiStatus(mode);
+    setIsAiThinking(false);
   };
 
   const handleAssignTask = () => {
@@ -941,11 +1081,14 @@ function App() {
               onChange={(event) => setChatInput(event.target.value)}
               placeholder="Ask about a neighborhood or compare zones..."
             />
-            <button type="submit" className="primary-btn">Ask</button>
+            <button type="submit" className="primary-btn" disabled={isAiThinking}>
+              {isAiThinking ? 'Thinking...' : 'Ask'}
+            </button>
           </form>
           <div className="chat-response">
-            {chatResponse}
+            {isAiThinking ? 'The assistant is analyzing the current hotspot data...' : chatResponse}
           </div>
+          <div className="status" style={{ marginTop: '8px' }}>{aiStatus}</div>
         </section>
       </main>
     </div>
