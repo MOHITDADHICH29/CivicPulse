@@ -91,7 +91,7 @@ Feel free to fork, modify, and improve this project. Your contributions are welc
 
 ## License
 
-This project is open source and available under the MIT License.
+This project is open source.
 
 ---
 
